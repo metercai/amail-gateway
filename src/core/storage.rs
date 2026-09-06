@@ -678,6 +678,93 @@ impl Database {
         Ok(())
     }
 
+    /// Atomically rename an agent address `old` → `new` across every
+    /// referencing table, inheriting all server-side resources:
+    ///
+    /// - `system_domains`/`domain_addr_meta` rows are re-keyed in place
+    ///   (webhook/secret/manager/signature/persona ride along — same row);
+    /// - `api_keys.domain_addr` is re-pointed — the agent's key itself is
+    ///   untouched, so the agent keeps working under the new address with
+    ///   the same credential (no re-activation);
+    /// - `whitelists` (domain_addr AND value sides), `agent_state`
+    ///   (agent_addr and address-embedded state keys), `boards.board_email`,
+    ///   `board_members.email`, `tasks.assignee/reviewer/created_by`,
+    ///   `task_events.actor` are migrated via copy-new/delete-old so a
+    ///   pre-existing new-key row wins (INSERT OR IGNORE semantics);
+    /// - mail history (`emails`, snapshots) is untouched — those are
+    ///   immutable string snapshots of the old identity.
+    ///
+    /// The whole migration runs in one `execute_batch` (single implicit
+    /// transaction): any failure rolls back everything.
+    ///
+    /// Caller must already have validated: `old` exists and belongs to the
+    /// requesting system, `new` is not registered anywhere, `new` is on the
+    /// same bare domain as `old`, `new`'s local part is legal, and no
+    /// `board_members` row already carries `new` (member merge is refused).
+    pub async fn rename_agent_address_refs(&self, old: &str, new: &str) -> AppResult<()> {
+        // Defense-in-depth: address components are strictly bounded so no
+        // quoting/escaping hazards can reach the batch text.
+        let safe = |s: &str| -> bool {
+            !s.is_empty()
+                && s.len() <= 255
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'@' | b'.' | b'-' | b'_' | b'+' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'/' | b'=' | b'?' | b'^' | b'`' | b'{' | b'|' | b'}' | b'~' | b'!'))
+        };
+        assert!(safe(old) && safe(new), "rename addresses must be bounded atext/no-quote strings");
+        let old = old.to_string();
+        let new = new.to_string();
+
+        self.call(move |conn| {
+            let batch = format!(
+                r#"
+BEGIN;
+-- domain_addr_meta: re-key in place (PK update; caller pre-checked new absent)
+UPDATE domain_addr_meta SET email_address = '{new}' WHERE email_address = '{old}';
+-- api_keys: re-point the agent key (key material untouched)
+UPDATE api_keys SET domain_addr = '{new}' WHERE domain_addr = '{old}';
+-- system_domains: re-key in place (webhook/secret ride along)
+UPDATE system_domains SET domain_addr = '{new}' WHERE domain_addr = '{old}';
+-- whitelists, domain_addr side: copy to new key then drop old rows
+INSERT OR IGNORE INTO whitelists(system_id,domain_addr,direction,value,description,is_active,created_at,category,api_key_id)
+  SELECT system_id,'{new}',direction,value,description,is_active,created_at,category,api_key_id
+  FROM whitelists WHERE domain_addr = '{old}';
+DELETE FROM whitelists WHERE domain_addr = '{old}';
+-- whitelists, value side (other agents' rows pointing at the old address):
+-- copy with the value rewritten, then drop the originals.
+INSERT OR IGNORE INTO whitelists(system_id,domain_addr,direction,value,description,is_active,created_at,category,api_key_id)
+  SELECT system_id,domain_addr,direction,'{new}',description,is_active,created_at,category,api_key_id
+  FROM whitelists WHERE value = '{old}' AND domain_addr <> '{old}';
+DELETE FROM whitelists WHERE value = '{old}' AND domain_addr <> '{old}';
+-- whitelists rows already re-keyed above whose value was also the old
+-- address (agent <-> manager bidirectional entries on the renamed address)
+UPDATE whitelists SET value = '{new}' WHERE domain_addr = '{new}' AND value = '{old}';
+-- agent_state: agent_addr side + state keys embedding the address
+-- (profile:/summary:/…:{old} → …:{new}); copy then drop.
+INSERT OR IGNORE INTO agent_state(agent_addr,state_key,state_value,created_at,updated_at)
+  SELECT CASE WHEN agent_addr = '{old}' THEN '{new}' ELSE agent_addr END,
+         replace(state_key,'{old}','{new}'), state_value, created_at, updated_at
+  FROM agent_state WHERE agent_addr = '{old}' OR state_key LIKE '%{old}%';
+DELETE FROM agent_state WHERE agent_addr = '{old}';
+DELETE FROM agent_state WHERE agent_addr <> '{old}' AND state_key LIKE '%{old}%';
+-- boards + members + tasks + events (same library DB)
+UPDATE boards SET board_email = '{new}' WHERE board_email = '{old}';
+INSERT OR IGNORE INTO board_members(email,role,display_name,board_token,board_id,joined_at,domains,capability_snapshot)
+  SELECT '{new}',role,display_name,board_token,board_id,joined_at,domains,capability_snapshot
+  FROM board_members WHERE email = '{old}';
+UPDATE tasks SET assignee = '{new}' WHERE assignee = '{old}';
+UPDATE tasks SET reviewer = '{new}' WHERE reviewer = '{old}';
+UPDATE tasks SET created_by = '{new}' WHERE created_by = '{old}';
+UPDATE task_events SET actor = '{new}' WHERE actor = '{old}';
+DELETE FROM board_members WHERE email = '{old}';
+COMMIT;
+"#,
+            );
+            conn.execute_batch(&batch)?;
+            Ok(())
+        })
+        .await
+    }
+
     /// Get the webhook config for a domain.
     // get_webhook_for_domain moved to AdvancedStorage (queries systems table)
 
@@ -1611,6 +1698,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_db() -> Database {
+        temp_db_with_path().0
+    }
+
+    fn temp_db_with_path() -> (Database, std::path::PathBuf) {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1619,8 +1710,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         // Database::open expects the SQLite FILE path (like main.rs passes
         // config.storage.db_path() = <dir>/aimail.db), not a directory.
-        let db = Database::open(&dir.join("aimail.db"), 4, None).unwrap();
-        db
+        let path = dir.join("aimail.db");
+        let db = Database::open(&path, 4, None).unwrap();
+        (db, path)
     }
 
     #[tokio::test]
@@ -1900,5 +1992,202 @@ mod tests {
         db.update_email_ready_retry("r1", 1, "2000-01-01T00:00:00Z")
             .await.unwrap().unwrap();
         assert_eq!(db.get_pending_retry_emails(10).await.unwrap().len(), 1);
+    }
+
+    /// Seed the board tables the migration touches (Database::open only
+    /// creates the core schema; board tables are created by the board module).
+    fn seed_board_tables(conn: &rusqlite::Connection) {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS boards (
+                id TEXT PRIMARY KEY, short_id TEXT UNIQUE NOT NULL,
+                board_email TEXT NOT NULL, goal TEXT, status TEXT DEFAULT 'active',
+                output_task_id TEXT, plan_version TEXT, plan_text TEXT,
+                plan_confirmed_at TEXT, criteria_version TEXT, criteria_text TEXT,
+                criteria_confirmed_at TEXT, created_at TEXT, completed_at TEXT, system_id TEXT
+            );
+            CREATE TABLE IF NOT EXISTS board_members (
+                email TEXT PRIMARY KEY, role TEXT NOT NULL, display_name TEXT NOT NULL,
+                board_token TEXT, board_id TEXT REFERENCES boards(id), joined_at TEXT,
+                domains TEXT, capability_snapshot TEXT
+            );
+            CREATE TABLE IF NOT EXISTS tasks (
+                id TEXT PRIMARY KEY, short_id TEXT NOT NULL, board_id TEXT REFERENCES boards(id),
+                title TEXT, body TEXT, status TEXT DEFAULT 'todo',
+                assignee TEXT REFERENCES board_members(email), reviewer TEXT,
+                parent_ids TEXT DEFAULT '[]', tags TEXT DEFAULT '[]', summary TEXT DEFAULT '',
+                metadata TEXT, created_by TEXT, created_at TEXT, updated_at TEXT,
+                completed_at TEXT, cancelled_at TEXT, deadline TEXT
+            );
+            CREATE TABLE IF NOT EXISTS task_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT REFERENCES tasks(id),
+                event_type TEXT, actor TEXT, payload TEXT, created_at TEXT
+            );",
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rename_agent_address_migrates_all_references() {
+        let (db, path) = temp_db_with_path();
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            seed_board_tables(&conn);
+            conn.execute_batch(
+                "INSERT INTO system_domains(id,system_id,domain_addr,webhook_url,webhook_secret)
+                   VALUES('d1','shared-sys1','old.agent@shared.example','http://hook','sec');
+                 INSERT INTO domain_addr_meta(email_address,system_id,manager_address,agent_signature,agent_persona)
+                   VALUES('old.agent@shared.example','shared-sys1','mgr@example.com','sig','persona');
+                 INSERT INTO api_keys(system_id,domain_addr,key_hash,key_prefix,scopes,category)
+                   VALUES('shared-sys1','old.agent@shared.example','hash123','pref','[\"agent\"]','agent');
+                 INSERT INTO whitelists(system_id,domain_addr,direction,value,description,category)
+                   VALUES('shared-sys1','old.agent@shared.example','all','mgr@example.com','agent-side','system'),
+                         ('shared-sys1','other.agent@shared.example','all','old.agent@shared.example','peer-side','system');
+                 INSERT INTO agent_state(agent_addr,state_key,state_value)
+                   VALUES('old.agent@shared.example','profile:old.agent@shared.example','{\"name\":\"Old\"}');
+                 INSERT INTO boards(id,short_id,board_email,goal) VALUES('b1','b1','old.agent@shared.example','g');
+                 INSERT INTO board_members(email,role,display_name,board_token,board_id,domains)
+                   VALUES('old.agent@shared.example','owner','Old Agent','tok','b1','[\"b1\"]');
+                 INSERT INTO tasks(id,short_id,board_id,title,assignee,reviewer,created_by)
+                   VALUES('t1','t1','b1','x','old.agent@shared.example','old.agent@shared.example','old.agent@shared.example');
+                 INSERT INTO task_events(task_id,event_type,actor,payload)
+                   VALUES('t1','comment','old.agent@shared.example','{}');",
+            )
+            .unwrap();
+        }
+
+        db.rename_agent_address_refs("old.agent@shared.example", "new.agent@shared.example")
+            .await
+            .unwrap();
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        // system_domains: re-keyed, webhook rides along
+        let row: (String, String) = conn
+            .query_row(
+                "SELECT domain_addr, webhook_secret FROM system_domains WHERE id='d1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            ("new.agent@shared.example".to_string(), "sec".to_string())
+        );
+        assert_eq!(
+            count_rows(
+                &conn,
+                "SELECT COUNT(*) FROM system_domains WHERE domain_addr='old.agent@shared.example'"
+            ),
+            0
+        );
+        // domain_addr_meta re-keyed with manager/signature intact
+        let meta: (String, String) = conn
+            .query_row(
+                "SELECT manager_address, agent_signature FROM domain_addr_meta WHERE email_address='new.agent@shared.example'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(meta, ("mgr@example.com".to_string(), "sig".to_string()));
+        // api_keys: re-pointed, key material untouched
+        let key: (String, String) = conn
+            .query_row(
+                "SELECT domain_addr, key_hash FROM api_keys WHERE key_prefix='pref'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            key,
+            (
+                "new.agent@shared.example".to_string(),
+                "hash123".to_string()
+            )
+        );
+        // whitelists both sides migrated, no orphans
+        assert_eq!(
+            count_rows(
+                &conn,
+                "SELECT COUNT(*) FROM whitelists WHERE domain_addr='new.agent@shared.example' AND value='mgr@example.com'"
+            ),
+            1
+        );
+        assert_eq!(
+            count_rows(
+                &conn,
+                "SELECT COUNT(*) FROM whitelists WHERE domain_addr='other.agent@shared.example' AND value='new.agent@shared.example'"
+            ),
+            1
+        );
+        assert_eq!(
+            count_rows(&conn, "SELECT COUNT(*) FROM whitelists WHERE value='old.agent@shared.example'"),
+            0
+        );
+        assert_eq!(
+            count_rows(
+                &conn,
+                "SELECT COUNT(*) FROM whitelists WHERE domain_addr='old.agent@shared.example'"
+            ),
+            0
+        );
+        // agent_state: addr re-keyed + embedded state key rewritten
+        assert_eq!(
+            count_rows(
+                &conn,
+                "SELECT COUNT(*) FROM agent_state WHERE agent_addr='new.agent@shared.example' AND state_key='profile:new.agent@shared.example'"
+            ),
+            1
+        );
+        assert_eq!(
+            count_rows(
+                &conn,
+                "SELECT COUNT(*) FROM agent_state WHERE agent_addr='old.agent@shared.example'"
+            ),
+            0
+        );
+        // boards/members/tasks/events all follow
+        assert_eq!(
+            count_rows(
+                &conn,
+                "SELECT COUNT(*) FROM boards WHERE board_email='new.agent@shared.example'"
+            ),
+            1
+        );
+        assert_eq!(
+            count_rows(
+                &conn,
+                "SELECT COUNT(*) FROM board_members WHERE email='new.agent@shared.example' AND role='owner' AND board_token='tok'"
+            ),
+            1
+        );
+        assert_eq!(
+            count_rows(
+                &conn,
+                "SELECT COUNT(*) FROM board_members WHERE email='old.agent@shared.example'"
+            ),
+            0
+        );
+        let t: (String, String) = conn
+            .query_row("SELECT assignee, reviewer FROM tasks WHERE id='t1'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(
+            t,
+            (
+                "new.agent@shared.example".to_string(),
+                "new.agent@shared.example".to_string()
+            )
+        );
+        assert_eq!(
+            count_rows(
+                &conn,
+                "SELECT COUNT(*) FROM task_events WHERE actor='new.agent@shared.example'"
+            ),
+            1
+        );
+    }
+
+    fn count_rows(conn: &rusqlite::Connection, sql: &str) -> i64 {
+        conn.query_row(sql, [], |r| r.get(0)).unwrap()
     }
 }

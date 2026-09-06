@@ -96,6 +96,10 @@ pub fn create_router(
             "/api/v1/admin/systems/:sid/addresses",
             post(register_address),
         )
+        .route(
+            "/api/v1/admin/systems/:sid/addresses/rename",
+            post(rename_agent_address),
+        )
         // Admin: agent metadata (manager, signature, persona, webhook)
         .route("/api/v1/admin/agent-meta/:email", put(update_agent_meta))
         // Admin: agent-scoped key-value state (profiles, summaries, message metadata)
@@ -940,6 +944,114 @@ async fn delete_system_domain(
             }),
         )),
     }
+}
+
+// ── Agent address rename (identity switch with full resource inheritance) ──
+
+/// POST /api/v1/admin/systems/:sid/addresses/rename
+/// Atomically renames an agent address old@domain → new@domain on the same
+/// domain. The agent's api_key is re-pointed (not regenerated), and every
+/// server-side reference — whitelists (both sides), contact/state keys,
+/// boards/members/tasks/events, webhook record — is migrated in one
+/// transaction, so the switch inherits all resources. The old address
+/// stops working (identity switch is complete); mail history snapshots are
+/// untouched.
+#[derive(Debug, Deserialize)]
+pub struct RenameAddressRequest {
+    pub old_email: String,
+    pub new_email: String,
+}
+
+async fn rename_agent_address(
+    state: axum::extract::State<HttpState>,
+    axum::extract::Extension(api_key): axum::extract::Extension<ApiKeyRecord>,
+    Path(tid): Path<String>,
+    Json(req): Json<RenameAddressRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    require_scope_any(&api_key, &["system"])?;
+    // agent_admin may only rename their own address.
+    if is_agent_admin_scope(&api_key) && api_key.email_address != req.old_email {
+        return Err((StatusCode::FORBIDDEN, Json(ErrorResponse {
+            error: "not_owner".into(),
+            detail: Some("agent_admin keys may only rename their own address".into()),
+        })));
+    }
+    let old = req.old_email.trim().to_lowercase();
+    let new = req.new_email.trim().to_lowercase();
+    if old == new {
+        return Err((StatusCode::BAD_REQUEST, Json(ErrorResponse {
+            error: "same_address".into(), detail: None,
+        })));
+    }
+    // Same bare domain required (rename is a local-part switch).
+    let old_domain = old.rsplit('@').next().unwrap_or("");
+    let new_domain = new.rsplit('@').next().unwrap_or("");
+    if old_domain.is_empty() || new_domain != old_domain {
+        return Err((StatusCode::BAD_REQUEST, Json(ErrorResponse {
+            error: "cross_domain_rename".into(),
+            detail: Some("rename must stay on the same bare domain".into()),
+        })));
+    }
+    // Local-part shape mirrors register_address validation.
+    let new_local = new.split('@').next().unwrap_or("");
+    let dot_count = new_local.bytes().filter(|&b| b == b'.').count();
+    let legal = !new_local.is_empty()
+        && new_local.len() <= 64
+        && new_local.bytes().all(|b| is_atext_no_dot(b))
+        && if tid.starts_with("shared-") { dot_count == 1 } else { dot_count == 0 };
+    if !legal {
+        return Err((StatusCode::BAD_REQUEST, Json(ErrorResponse {
+            error: "invalid_email".into(),
+            detail: Some("new local-part must match the system's address format (shared: one dot; non-shared: none), atext-no-dot only".into()),
+        })));
+    }
+    // `new` must not already be registered anywhere.
+    let ef = &state.factories.email.env_factory;
+    if ef.lookup_domain_addr(&new).await.ok().flatten().is_some()
+        || ef.db.get_domain_addr_meta(&new).await.ok().flatten().is_some()
+    {
+        return Err((StatusCode::CONFLICT, Json(ErrorResponse {
+            error: "already_exists".into(),
+            detail: Some(format!("'{new}' is already a registered address")),
+        })));
+    }
+    // `old` must exist and belong to this system.
+    let rec = match ef.db.get_system_domain_by_name(&old).await {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return Err((StatusCode::NOT_FOUND, Json(ErrorResponse {
+                error: "agent_not_found".into(),
+                detail: Some(format!("No registered address '{old}'")),
+            })));
+        }
+        Err(e) => {
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
+                error: "Database error".into(),
+                detail: Some(e.to_string()),
+            })));
+        }
+    };
+    if rec.system_id != tid {
+        return Err((StatusCode::FORBIDDEN, Json(ErrorResponse {
+            error: "forbidden".into(),
+            detail: Some("Address does not belong to this system".into()),
+        })));
+    }
+
+    if let Err(e) = ef.db.rename_agent_address_refs(&old, &new).await {
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
+            error: "Database error".into(),
+            detail: Some(e.to_string()),
+        })));
+    }
+    info!(operation = "agent_address_renamed", system_id = %tid, old = %old, new = %new, "Agent address renamed with resource inheritance");
+    Ok(Json(serde_json::json!({
+        "status": "renamed",
+        "old": old,
+        "new": new,
+        "system_id": tid,
+        "key_preserved": true,
+    })))
 }
 
 // ── Agent Meta (domain_addr_meta) ──
