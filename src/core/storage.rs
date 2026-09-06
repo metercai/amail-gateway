@@ -22,6 +22,9 @@ use crate::core::whitelist::{is_whitelisted_wildcard, WhitelistCache};
 #[derive(Clone)]
 pub struct Database {
     pool: Pool<SqliteConnectionManager>,
+    /// Absolute path of the SQLite file this Database talks to. Used to
+    /// derive sibling storage areas (e.g. per-board DBs under a2a_board/).
+    db_file: std::path::PathBuf,
     pub whitelist_cache: Arc<WhitelistCache>,
     /// Domain lookup cache.
     pub domain_cache: Arc<RwLock<HashMap<String, (Instant, Option<SystemDomainRecord>)>>>,
@@ -110,6 +113,7 @@ impl Database {
                         init_connection(&conn2)?;
                         return Ok(Self {
                             pool: pool2,
+                            db_file: path_ref.to_path_buf(),
                             whitelist_cache: Arc::new(WhitelistCache::new()),
                             domain_cache: Arc::new(RwLock::new(HashMap::new())),
                         });
@@ -122,6 +126,7 @@ impl Database {
         }
 
         Ok(Self {
+            db_file: path_ref.to_path_buf(),
             pool,
             whitelist_cache: Arc::new(WhitelistCache::new()),
             domain_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -713,6 +718,7 @@ impl Database {
         assert!(safe(old) && safe(new), "rename addresses must be bounded atext/no-quote strings");
         let old = old.to_string();
         let new = new.to_string();
+        let db_file = self.db_file.clone();
 
         self.call(move |conn| {
             let batch = format!(
@@ -746,16 +752,6 @@ INSERT OR IGNORE INTO agent_state(agent_addr,state_key,state_value,created_at,up
   FROM agent_state WHERE agent_addr = '{old}' OR state_key LIKE '%{old}%';
 DELETE FROM agent_state WHERE agent_addr = '{old}';
 DELETE FROM agent_state WHERE agent_addr <> '{old}' AND state_key LIKE '%{old}%';
--- boards + members + tasks + events (same library DB)
-UPDATE boards SET board_email = '{new}' WHERE board_email = '{old}';
-INSERT OR IGNORE INTO board_members(email,role,display_name,board_token,board_id,joined_at,domains,capability_snapshot)
-  SELECT '{new}',role,display_name,board_token,board_id,joined_at,domains,capability_snapshot
-  FROM board_members WHERE email = '{old}';
-UPDATE tasks SET assignee = '{new}' WHERE assignee = '{old}';
-UPDATE tasks SET reviewer = '{new}' WHERE reviewer = '{old}';
-UPDATE tasks SET created_by = '{new}' WHERE created_by = '{old}';
-UPDATE task_events SET actor = '{new}' WHERE actor = '{old}';
-DELETE FROM board_members WHERE email = '{old}';
 COMMIT;
 "#,
             );
@@ -765,6 +761,39 @@ COMMIT;
                 // pooled connection never leaks a half-applied migration.
                 let _ = conn.execute_batch("ROLLBACK;");
                 return Err(e.into());
+            }
+
+            // Boards live in per-board DB files ({storage}/a2a_board/*.db,
+            // one file per board). Migrate the address there file by file;
+            // a failing board file is logged and skipped — it never blocks
+            // the main-library migration (board data is not lost, only the
+            // stale name remains until the next member sync).
+            let boards_dir = db_file.parent().unwrap_or(std::path::Path::new("")).join("a2a_board");
+            if boards_dir.is_dir() {
+                let board_sql = format!(
+                    "UPDATE boards SET board_email = '{new}' WHERE board_email = '{old}';
+                     INSERT OR IGNORE INTO board_members(email,role,display_name,board_token,board_id,joined_at,domains,capability_snapshot)
+                       SELECT '{new}',role,display_name,board_token,board_id,joined_at,domains,capability_snapshot
+                       FROM board_members WHERE email = '{old}';
+                     UPDATE tasks SET assignee = '{new}' WHERE assignee = '{old}';
+                     UPDATE tasks SET reviewer = '{new}' WHERE reviewer = '{old}';
+                     UPDATE tasks SET created_by = '{new}' WHERE created_by = '{old}';
+                     UPDATE task_events SET actor = '{new}' WHERE actor = '{old}';
+                     DELETE FROM board_members WHERE email = '{old}';"
+                );
+                if let Ok(entries) = std::fs::read_dir(&boards_dir) {
+                    for entry in entries.flatten() {
+                    let pth = entry.path();
+                    if pth.extension().and_then(|e| e.to_str()) != Some("db") {
+                        continue;
+                    }
+                        if let Ok(bconn) = rusqlite::Connection::open(&pth) {
+                            if let Err(e) = bconn.execute_batch(&board_sql) {
+                                eprintln!("[rename] board db {} update failed: {}", pth.display(), e);
+                            }
+                        }
+                    }
+                }
             }
             Ok(())
         })
@@ -2037,7 +2066,6 @@ mod tests {
         let (db, path) = temp_db_with_path();
         {
             let conn = rusqlite::Connection::open(&path).unwrap();
-            seed_board_tables(&conn);
             conn.execute_batch(
                 "INSERT INTO system_domains(id,system_id,domain_addr,webhook_url,webhook_secret)
                    VALUES('d1','shared-sys1','old.agent@shared.example','http://hook','sec');
@@ -2050,7 +2078,19 @@ mod tests {
                          ('shared-sys1','other.agent@shared.example','all','old.agent@shared.example','peer-side','system');
                  INSERT INTO agent_state(agent_addr,state_key,state_value)
                    VALUES('old.agent@shared.example','profile:old.agent@shared.example','{\"name\":\"Old\"}');
-                 INSERT INTO boards(id,short_id,board_email,goal) VALUES('b1','b1','old.agent@shared.example','g');
+",
+            )
+            .unwrap();
+        }
+
+        // Boards live in per-board db files: {storage}/a2a_board/{id}.db
+        let board_dir = path.parent().unwrap().join("a2a_board");
+        std::fs::create_dir_all(&board_dir).unwrap();
+        {
+            let bconn = rusqlite::Connection::open(board_dir.join("b1.db")).unwrap();
+            seed_board_tables(&bconn);
+            bconn.execute_batch(
+                "INSERT INTO boards(id,short_id,board_email,goal) VALUES('b1','b1','old.agent@shared.example','g');
                  INSERT INTO board_members(email,role,display_name,board_token,board_id,domains)
                    VALUES('old.agent@shared.example','owner','Old Agent','tok','b1','[\"b1\"]');
                  INSERT INTO tasks(id,short_id,board_id,title,assignee,reviewer,created_by)
@@ -2150,29 +2190,30 @@ mod tests {
             ),
             0
         );
-        // boards/members/tasks/events all follow
+        // boards/members/tasks/events all follow (in the per-board db file)
+        let bconn = rusqlite::Connection::open(board_dir.join("b1.db")).unwrap();
         assert_eq!(
             count_rows(
-                &conn,
+                &bconn,
                 "SELECT COUNT(*) FROM boards WHERE board_email='new.agent@shared.example'"
             ),
             1
         );
         assert_eq!(
             count_rows(
-                &conn,
+                &bconn,
                 "SELECT COUNT(*) FROM board_members WHERE email='new.agent@shared.example' AND role='owner' AND board_token='tok'"
             ),
             1
         );
         assert_eq!(
             count_rows(
-                &conn,
+                &bconn,
                 "SELECT COUNT(*) FROM board_members WHERE email='old.agent@shared.example'"
             ),
             0
         );
-        let t: (String, String) = conn
+        let t: (String, String) = bconn
             .query_row("SELECT assignee, reviewer FROM tasks WHERE id='t1'", [], |r| {
                 Ok((r.get(0)?, r.get(1)?))
             })
@@ -2186,7 +2227,7 @@ mod tests {
         );
         assert_eq!(
             count_rows(
-                &conn,
+                &bconn,
                 "SELECT COUNT(*) FROM task_events WHERE actor='new.agent@shared.example'"
             ),
             1
