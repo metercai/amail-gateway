@@ -759,7 +759,13 @@ DELETE FROM board_members WHERE email = '{old}';
 COMMIT;
 "#,
             );
-            conn.execute_batch(&batch)?;
+            if let Err(e) = conn.execute_batch(&batch) {
+                // Any statement failed mid-batch: the implicit transaction
+                // opened by BEGIN is still open — roll it back so the
+                // pooled connection never leaks a half-applied migration.
+                let _ = conn.execute_batch("ROLLBACK;");
+                return Err(e.into());
+            }
             Ok(())
         })
         .await
